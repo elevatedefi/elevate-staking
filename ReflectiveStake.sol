@@ -1,12 +1,12 @@
 pragma solidity >=0.6.0 <0.8.0;
-// ABIEncoderV2 added for Flow Protocol
 pragma experimental ABIEncoderV2;
 
 import "openzeppelin-solidity/contracts/math/SafeMath.sol";
+import "openzeppelin-solidity/contracts/utils/ReentrancyGuard.sol";
 import "./ITREASURY.sol";
 import "./TokenPool.sol";
 
-contract ReflectiveStake {
+contract ReflectiveStake is ReentrancyGuard{
     using SafeMath for uint256;
 
     event Staked(address indexed user, uint256 amount, uint256 total, bytes data);
@@ -57,16 +57,16 @@ contract ReflectiveStake {
     constructor(IERC20 stakingToken, IERC20 distributionToken, ITREASURY reflectiveTreasury,
                 uint256 startBonus_, uint256 bonusPeriodSec_, uint256 initialSharesPerToken, uint256 lockupSec_) public {
         // The start bonus must be some fraction of the max. (i.e. <= 100%)
-        require(startBonus_ <= 10**BONUS_DECIMALS, 'TokenGeyser: start bonus too high');
+        require(startBonus_ <= 10**BONUS_DECIMALS, 'ReflectiveStake: start bonus too high');
         // If no period is desired, instead set startBonus = 100%
         // and bonusPeriod to a small value like 1sec.
-        require(bonusPeriodSec_ != 0, 'TokenGeyser: bonus period is zero');
-        require(initialSharesPerToken > 0, 'TokenGeyser: initialSharesPerToken is zero');
+        require(bonusPeriodSec_ > 0, 'ReflectiveStake: bonus period is zero');
+        require(initialSharesPerToken > 0, 'ReflectiveStake: initialSharesPerToken is zero');
 
         _stakingPool = new TokenPool(stakingToken);
         _unlockedPool = new TokenPool(distributionToken);
         _reflectiveTreasury = reflectiveTreasury;
-        require(_unlockedPool.token() == _reflectiveTreasury.token());
+        require(_unlockedPool.token() == _reflectiveTreasury.token(), 'ReflectiveStake: distribution token does not match treasury token');
         startBonus = startBonus_;
         bonusPeriodSec = bonusPeriodSec_;
         _initialSharesPerToken = initialSharesPerToken;
@@ -77,19 +77,14 @@ contract ReflectiveStake {
         return _stakingPool.token();
     }
 
-    function getDistributionToken() public view returns (IERC20) {
+    function getDistributionToken() external view returns (IERC20) {
         return _unlockedPool.token();
     }
 
-    function stake(uint256 amount) external {
-        _stakeFor(msg.sender, msg.sender, amount);
-    }
-
-    function _stakeFor(address staker, address beneficiary, uint256 amount) private {
-        require(amount > 0, 'TokenGeyser: stake amount is zero');
-        require(beneficiary != address(0), 'TokenGeyser: beneficiary is zero address');
+    function stake(uint256 amount) external nonReentrant {
+        require(amount > 0, 'ReflectiveStake: stake amount is zero');
         require(totalStakingShares == 0 || totalStaked() > 0,
-                'TokenGeyser: Invalid state. Staking shares exist, but no staking tokens do');
+                'ReflectiveStake: Invalid state. Staking shares exist, but no staking tokens do');
 
         // Get Actual Amount here minus TX fee
         uint256 transferAmount = _applyFee(amount);
@@ -97,26 +92,26 @@ contract ReflectiveStake {
         uint256 mintedStakingShares = (totalStakingShares > 0)
             ? totalStakingShares.mul(transferAmount).div(totalStaked())
             : transferAmount.mul(_initialSharesPerToken);
-        require(mintedStakingShares > 0, 'TokenGeyser: Stake amount is too small');
+        require(mintedStakingShares > 0, 'ReflectiveStake: Stake amount is too small');
 
         updateAccounting();
 
         // 1. User Accounting
-        UserTotals storage totals = _userTotals[beneficiary];
+        UserTotals storage totals = _userTotals[msg.sender];
         totals.stakingShares = totals.stakingShares.add(mintedStakingShares);
         totals.lastAccountingTimestampSec = block.timestamp;
 
         Stake memory newStake = Stake(mintedStakingShares, block.timestamp);
-        _userStakes[beneficiary].push(newStake);
+        _userStakes[msg.sender].push(newStake);
 
         // 2. Global Accounting
         totalStakingShares = totalStakingShares.add(mintedStakingShares);
 
         // interactions
-        require(_stakingPool.token().transferFrom(staker, address(_stakingPool), amount),
-            'TokenGeyser: transfer into staking pool failed');
+        require(_stakingPool.token().transferFrom(msg.sender, address(_stakingPool), amount),
+            'ReflectiveStake: transfer into staking pool failed');
 
-        emit Staked(beneficiary, transferAmount, totalStakedFor(beneficiary), "");
+        emit Staked(msg.sender, transferAmount, totalStakedFor(msg.sender), "");
     }
 
     /**
@@ -129,26 +124,30 @@ contract ReflectiveStake {
         return tTransferAmount;
     }
 
-    function unstakeMax() public returns (uint256) {
-        return unstake(totalStakedFor(msg.sender));
+    function unstake(uint256 amount) external nonReentrant returns (uint256) {
+        updateAccounting();
+        return _unstake(amount);
     }
 
-    function unstake(uint256 amount) public returns (uint256) {
+    function unstakeMax() external nonReentrant returns (uint256) {
         updateAccounting();
+        return _unstake(totalStakedFor(msg.sender));
+    }
 
+    function _unstake(uint256 amount) private returns (uint256) {
         // checks
-        require(amount > 0, 'TokenGeyser: unstake amount is zero');
+        require(amount > 0, 'ReflectiveStake: unstake amount is zero');
         require(totalStakedFor(msg.sender) >= amount,
-            'TokenGeyser: unstake amount is greater than total user stakes');
+            'ReflectiveStake: unstake amount is greater than total user stakes');
         uint256 stakingSharesToBurn = totalStakingShares.mul(amount).div(totalStaked());
-        require(stakingSharesToBurn > 0, 'TokenGeyser: Unable to unstake amount this small');
+        require(stakingSharesToBurn > 0, 'ReflectiveStake: Unable to unstake amount this small');
 
         // 1. User Accounting
         UserTotals storage totals = _userTotals[msg.sender];
         Stake[] storage accountStakes = _userStakes[msg.sender];
 
         Stake memory mostRecentStake = accountStakes[accountStakes.length - 1];
-        require(block.timestamp.sub(mostRecentStake.timestampSec) > lockupSec, 'TokenGeyser: Cannot unstake before the lockup period has expired');
+        require(block.timestamp.sub(mostRecentStake.timestampSec) > lockupSec, 'ReflectiveStake: Cannot unstake before the lockup period has expired');
 
         // Redeem from most recent stake and go backwards in time.
         uint256 stakingShareSecondsToBurn = 0;
@@ -183,11 +182,11 @@ contract ReflectiveStake {
 
         // interactions
         require(_stakingPool.transfer(msg.sender, amount),
-            'TokenGeyser: transfer out of staking pool failed');
+            'ReflectiveStake: transfer out of staking pool failed');
 
         if (rewardAmount > 0) {
             require(_unlockedPool.transfer(msg.sender, rewardAmount),
-                'TokenGeyser: transfer out of unlocked pool failed');
+                'ReflectiveStake: transfer out of unlocked pool failed');
         }
 
 
@@ -195,7 +194,7 @@ contract ReflectiveStake {
         emit TokensClaimed(msg.sender, rewardAmount);
 
         require(totalStakingShares == 0 || totalStaked() > 0,
-                "TokenGeyser: Error unstaking. Staking shares exist, but no staking tokens do");
+                "ReflectiveStake: Error unstaking. Staking shares exist, but no staking tokens do");
         return rewardAmount;
     }
 
@@ -221,12 +220,12 @@ contract ReflectiveStake {
         return currentRewardTokens.add(bonusedReward);
     }
 
-    function getUserStakes(address addr) public view returns (Stake[] memory){
+    function getUserStakes(address addr) external view returns (Stake[] memory){
         Stake[] memory userStakes = _userStakes[addr];
         return userStakes;
     }
 
-    function getUserTotals(address addr) public view returns (UserTotals memory) {
+    function getUserTotals(address addr) external view returns (UserTotals memory) {
         UserTotals memory userTotals = _userTotals[addr];
         return userTotals;
     }
@@ -286,7 +285,7 @@ contract ReflectiveStake {
         );
     }
 
-    function isUnlocked(address account) public view returns (bool) {
+    function isUnlocked(address account) external view returns (bool) {
         if (totalStakedFor(account) == 0) return false;
         Stake[] memory accountStakes = _userStakes[account];
         Stake memory mostRecentStake = accountStakes[accountStakes.length - 1];
@@ -301,7 +300,7 @@ contract ReflectiveStake {
         return _unlockedPool.balance();
     }
 
-    function totalAvailable() public view returns (uint256) {
+    function totalAvailable() external view returns (uint256) {
         return totalUnlocked().add(totalPending());
     }
 
