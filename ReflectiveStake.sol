@@ -247,7 +247,7 @@ contract ReflectiveStake is ReentrancyGuard{
         return address(_unlockedPool);
     }
 
-    function updateAccounting() public returns (
+    function updateAccounting() private returns (
         uint256, uint256, uint256, uint256, uint256, uint256) {
 
         unlockTokens();
