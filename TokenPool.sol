@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 pragma solidity >=0.6.0 <0.8.0;
 
 import "openzeppelin-solidity/contracts/access/Ownable.sol";
@@ -15,7 +17,7 @@ contract TokenPool is Ownable {
         token = _token;
     }
 
-    function balance() public view returns (uint256) {
+    function balance() external view returns (uint256) {
         return token.balanceOf(address(this));
     }
 
